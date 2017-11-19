@@ -1,0 +1,120 @@
+---
+title: "Citibike Station Use"
+author: "Vitaly Druker"
+date: "November 20th, 2017"
+output: 
+  ioslides_presentation:
+    widescreen: true
+---
+
+```{r setup, include=FALSE}
+# to enable presenter mode add ?presentme=true to the URL of the presentation
+
+knitr::opts_chunk$set(echo = FALSE,
+                      comment = NA,
+                      warning = FALSE,
+                      # cache = TRUE,
+                      fig.align = 'center', 
+                      dev.args = list(bg = 'transparent'))
+
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(knitr)
+library(pander)
+library(tibble)
+options(tibble.print_max = 5)
+
+library(readr)
+library(tidyr)
+library(ggmap)
+library(stringr)
+library(lme4)
+
+source('../stat 787 - hw/helper_functions.R')
+
+
+theme_update(plot.background = element_rect(fill = "transparent", color = NA))
+
+```
+
+```{r load_data}
+load('transformed_data/citibike_rides.Rdata')
+
+labeled_stations <-
+  read_csv(
+    'transformed_data/labeled_stations.csv',
+    col_types = cols(
+      startstationid = col_character(),
+      startstationname = col_character(),
+      startstationlatitude = col_double(),
+      startstationlongitude = col_double(),
+      cluster = col_character()
+    )
+  )
+
+```
+
+## Overview
+
+1. Problem Overview
+2. What Data is Used?
+3. Regression Analysis
+4. Spatial Analysis
+
+# Problem Overview
+
+## Question 1
+
+Does the proximity of opening a new station effect the ridership of other stations near the newly opened station?
+
+> - Not able to turn this into a 'spatial data' problem, seems like a distance problem
+
+## Question 2 
+
+How does the proximity of NYC subway stations effect ridership?
+
+> - Bike Share guide recommends placing bike stations near public transit. [NACTO](https://nacto.org/wp-content/uploads/2016/04/NACTO-Bike-Share-Siting-Guide_FINAL.pdf)
+
+# Data Sources 
+
+## Citibike Data | Source {.build}
+
+[Ridership Data](https://www.citibikenyc.com/system-data)
+
+```{r}
+d_filt %>% 
+  select(-startstationlatitude, -startstationlongitude, 
+         -endstationlatitude, -endstationlongitude,
+         -mnth_trip, -day_trip) %>% 
+  glimpse
+```
+
+## Citibike Data | Summary Statistics {.build}
+
+Time: 6 - 10 am weekday mornings
+
+Date Range: 
+```{r}
+range(d_filt$day_trip)
+```
+
+Stations:
+```{r}
+nrow(labeled_stations)
+```
+
+## Citibike Data | Summary Statistics {.build}
+
+
+
+
+
+## Historic Weather Data
+
+### [NOAA Data Request](https://www.ncdc.noaa.gov/cdo-web/)
+
+
+
+
+
