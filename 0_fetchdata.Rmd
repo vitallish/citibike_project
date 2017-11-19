@@ -1,0 +1,108 @@
+---
+title: "Load Data"
+author: "Vitaly Druker"
+date: "9/21/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+library(readr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(ggmap)
+
+```
+
+## Download Data
+
+```{r, eval=FALSE}
+library(RCurl)
+url <- 'https://s3.amazonaws.com/tripdata/'
+filenames = getURL(url, dirlistonly = TRUE)
+
+list.files('https://s3.amazonaws.com/tripdata/')
+
+library(XML)
+files <- xmlToDataFrame(filenames)
+files <- files %>% 
+  filter(grepl("^[0-9]{6}-citibike",Key)) %>% 
+  mutate(full_path = paste0(url, Key))
+
+
+files %$%  
+  walk2(full_path,Key, ~download.file(.x, file.path('data',.y)))
+
+```
+
+
+
+
+## Load Data
+
+```{r}
+data_files <- list.files('data', pattern = "zip",full.names = T)
+
+data_files_df <- data.frame(data_files, stringsAsFactors = FALSE)
+
+# set.seed(5)
+all_data <- data_files_df %>% 
+  # filter(grepl('20150[123]', data_files)) %>% 
+  mutate(data = map(data_files, read_csv,
+                   col_types = cols(.default = col_character()),
+                   progress =FALSE ),
+         data = map(data, function(x){
+           n <- names(x)
+           n <- tolower(n)
+           n <- gsub(pattern = " +",replacement = "",x = n)
+           names(x) <- n
+           x
+         }))
+
+```
+
+## Transform Data
+```{r}
+
+
+all_data <- all_data$data %>% bind_rows() %>% 
+  mutate_at(vars(tripduration, startstationlatitude,startstationlongitude,
+                   endstationlatitude,endstationlongitude,bikeid,birthyear,
+                   startstationid, endstationid, tripduration), funs(as.numeric)) %>% 
+  # mutate(starttime_old = starttime) %>% 
+  mutate_at(vars(starttime, stoptime), 
+            funs(parse_date_time(., 
+                                 orders = c("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", 
+                                            "%m/%d/%Y %H:%M:%S %p","%m/%d/%Y %H:%M"), 
+                                 exact = TRUE)))
+```
+
+## Data QA 
+
+```{r}
+
+# all_data %>% 
+#   filter(is.na(starttime)) %>% 
+#   select(starttime, starttime_old)
+
+all_data %>% 
+  sapply(FUN = function(x)  sum(is.na(x))/length(x))
+
+
+all_data %>% 
+  mutate(dt = floor_date(starttime, unit = "months")) %>% 
+  count(dt)
+  filter(is.na(starttime))
+
+
+```
+
+## Save Data
+```{r}
+save(all_data, file = 'transformed_data/transformed.Rdata')
+```
+

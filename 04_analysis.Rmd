@@ -1,0 +1,567 @@
+---
+title: "Citibike Demand Analysis"
+author: "Vitaly Druker"
+date: "9/19/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+library(readr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(ggmap)
+library(stringr)
+library(lme4)
+
+source('../stat 787 - hw/helper_functions.R')
+
+```
+# Load Data
+```{r}
+load('transformed_data/transformed.Rdata')
+```
+
+# Weather Analysis
+```{r}
+
+weather_data <- read_csv('weather_data/NYC_20130101-20170731.csv')
+weather_data <- weather_data %>% 
+  mutate(day_trip = mdy(DATE),
+         day_trip = as.POSIXct(day_trip)) %>% 
+  select(day_trip, PRCP, SNOW, SNWD, TMIN, TMAX)
+
+```
+
+
+# Number of Open Bikes
+
+```{r}
+historical_files_names <- 
+  list.files(path = "historical_feeds", 
+             pattern = "bikeshare_nyc_raw.csv", 
+             recursive = TRUE, 
+             full.names = TRUE)
+
+all_historical_data <- historical_files_names %>% 
+  lapply(read_delim, delim = "\t",
+         col_types = cols(
+  dock_id = col_integer(),
+  dock_name = col_character(),
+  date = col_character(),
+  hour = col_integer(),
+  minute = col_integer(),
+  pm = col_integer(),
+  avail_bikes = col_integer(),
+  avail_docks = col_integer(),
+  tot_docks = col_integer(),
+  `_lat` = col_double(),
+  `_long` = col_double(),
+  in_service = col_integer(),
+  status_key = col_integer()
+)) %>% 
+  bind_rows
+
+# all_historical_data %>% count(dock_id)
+
+bike_dock_data <- all_historical_data %>% 
+  select(dock_id:tot_docks) %>% 
+  mutate(hour = hour + pm*12) %>% 
+  mutate_at(vars(hour, minute), funs((str_pad(., width = 2, pad = "0")))) %>%
+  mutate(time_log = paste(hour, minute, "00",  sep= ":")) %>% 
+  mutate(dt_log = paste0("20", date, " ", time_log)) %>% 
+  mutate(dt_log = ymd_hms(dt_log)) %>% 
+  select(dock_id, dock_name, dt_log, avail_bikes, avail_docks, tot_docks) %>% 
+  mutate(date_log = floor_date(dt_log, unit = "days")) %>% 
+  filter(hour(dt_log) == 6) %>% 
+  group_by(dock_id,dock_name, date_log) %>% 
+  filter(row_number(dt_log) == 1)
+
+bike_dock_data <- bike_dock_data %>% 
+  select(dock_id, dock_name, date_log, avail_bikes, tot_docks) %>% 
+  ungroup() %>% 
+  mutate(dock_id = as.character(dock_id))
+
+# get minimum number of bikes available
+min_bikes_avail <- all_historical_data %>% 
+  select(dock_id:tot_docks) %>% 
+  mutate(hour = hour + pm*12) %>% 
+  mutate_at(vars(hour, minute), funs((str_pad(., width = 2, pad = "0")))) %>%
+  mutate(time_log = paste(hour, minute, "00",  sep= ":")) %>% 
+  mutate(dt_log = paste0("20", date, " ", time_log)) %>% 
+  mutate(dt_log = ymd_hms(dt_log)) %>% 
+  select(dock_id, dock_name, dt_log, avail_bikes, avail_docks, tot_docks) %>% 
+  mutate(date_log = floor_date(dt_log, unit = "days")) %>% 
+  filter(between(hour(dt_log),6,10)) %>% 
+  group_by(dock_id,dock_name, date_log) %>% 
+  summarise(min_avail = min(avail_bikes)) %>% 
+  ungroup() %>% 
+  mutate(dock_id = as.character(dock_id))
+
+min_bikes_avail <- min_bikes_avail %>% 
+  ungroup() %>% 
+  mutate(dock_id = as.character(dock_id))
+
+bike_dock_data <- left_join(bike_dock_data, min_bikes_avail)
+```
+
+# Exploratory Analysis 
+
+```{r}
+station_cts <- all_data %>% 
+  mutate(mnth_trip = floor_date(starttime, unit = "months")) %>% 
+  count(mnth_trip, startstationname)
+
+station_flow <- station_cts %>% 
+  spread(`startstationname`, n) %>% 
+  gather('station','ct', -mnth_trip,na.rm = FALSE) %>% 
+  group_by(station) %>% 
+  arrange(station, mnth_trip) %>% 
+  mutate(new = !is.na(ct) & is.na(lag(ct)),
+         removed = is.na(ct) & !is.na(lag(ct)),
+         changed = new | removed
+         ) %>% 
+  group_by(mnth_trip) %>% 
+  summarise_at(vars(new, removed, changed), sum)
+
+
+
+# test %>% 
+#   gather("type","ct", -mnth_trip) %>% 
+#   filter(type !="changed", mnth_trip >= ymd('2014-01-01')) %>% 
+#   ggplot(aes(mnth_trip, ct, color = type)) + geom_line() +
+#   coord_cartesian(ylim = c(0,15))
+# 
+
+
+station_flow %>% 
+  mutate(net_change = new-removed,
+         total_stations = cumsum(net_change)) %>% 
+  ggplot(aes(x = mnth_trip, y = total_stations)) +
+  geom_line(color = "red") + 
+  labs(title = "Number of CitiBike Stations")
+
+```
+## Monthly Rides
+
+```{r}
+# all_data %>% 
+#   slice(1:100) %>% 
+#   mutate(weekend = wday(starttime) %in% 2:6)
+
+
+d_filt <- all_data %>%
+  mutate_at(vars(startstationid,endstationid), as.character) %>% 
+  filter(between(hour(starttime), 6, 10)) %>% # only rides that start between 6 and 10 am
+  filter(wday(starttime) %in% 2:6) %>% # only weekdays
+  mutate(mnth_trip = floor_date(starttime, unit = "months"),
+         day_trip = floor_date(starttime, unit = "days")) 
+
+d_filt %>% 
+  # count(mnth_trip, startstationname) %>% 
+  ggplot(aes(x = mnth_trip)) +
+  geom_bar() +
+  theme(legend.position = "none") +
+  labs("Citibike Rides per Month")
+```
+
+```{r}
+
+stations <- d_filt %>% 
+  select(startstationid:startstationlongitude) %>% 
+  distinct() %>% 
+  # mutate(startstationid = as.character(startstationid)) %>% 
+  filter(startstationlatitude != 0)
+
+daily_cts <- d_filt %>% 
+  count(day_trip, startstationid) 
+
+county_map <- map_data("county")
+
+
+# stations <- stations %>% filter(startstationlatitude != 0)
+
+sbbox <- make_bbox(lon = stations$startstationlongitude, lat = stations$startstationlatitude, f = .1)
+# sq_map <- get_map(location = c(lon = -73.985130,
+#                                lat = 40.758896), 
+#                   maptype = "terrain", source = "google", zoom = 12, messaging = FALSE)
+
+sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE)
+
+mapping_data <- daily_cts %>% 
+  spread(startstationid, n, fill = NA) %>% 
+  gather("startstationid","n", -day_trip) %>% 
+  left_join(stations) %>% 
+  filter(day_trip %in% sample(day_trip, 10)) %>% 
+  filter(startstationlongitude != 0) %>% 
+  filter(!is.na(n)) %>% 
+  mutate(state = "new york")
+
+ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, size = n), 
+             alpha = 0.3, data = mapping_data) + facet_wrap(~day_trip, ncol = 5) +
+  theme_inset()
+
+```
+
+```{r}
+cluster_data <- stations %>% 
+  select(startstationlatitude, startstationlongitude) %>% 
+  # mutate_all(funs("sq" = . %>% )) %>% 
+  as.matrix()
+
+
+
+kms_centers <- rbind(
+c(40.72985,             -73.99455),
+c(40.69192,             -73.97340),
+c(40.76984,             -73.96810)
+)
+
+kmeans_data <- kmeans(cluster_data, kms_centers)
+
+
+stations2 <- cbind(stations, cluster = kmeans_data$cluster)
+
+
+obj <- ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, color  = as.factor(cluster), label = startstationid),data = stations2)  +
+  theme(axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  coord_map()
+obj
+
+# ggplotly(obj, layerData = 1)
+
+#332 should be manhatt (cluster 1)
+# 3112 3113 3115 3469 3116 3114 (cluster 2)
+
+stations2$cluster[stations2$startstationid %in% c(332)] <- 1
+stations2$cluster[stations2$startstationid %in% c(3112,3113,3115,3469,3116,3114)] <- 2
+
+obj <- ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, color  = as.factor(cluster)),data = stations2)  +
+  theme(axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  coord_map() + 
+  labs(color = 'group')
+obj
+
+# ggmap(sq_map) +
+#   geom_point(aes(x = startstationlongitude, y = startstationlatitude, color  = startstationid =='3427'), data = stations2)  +
+#   theme(axis.title = element_blank(),
+#         axis.ticks = element_blank(),
+#         axis.text = element_blank()) + 
+#   coord_map()
+
+readr::write_csv(stations2,path = "transformed_data/labeled_stations.csv")
+
+```
+
+```{r}
+valid_stations <- stations2 %>% 
+  filter(cluster == 1)
+
+d_filt <- d_filt %>% 
+   semi_join(valid_stations, by = "startstationid")
+```
+
+## Show the effect of adding a specific station
+
+```{r}
+# 
+# d_filt <- all_data %>% 
+#   mutate(startstationid = as.character(startstationid)) %>% 
+#   filter(between(hour(starttime), 6, 10)) %>% # only rides that start between 6 and 10 am
+#   filter(wday(starttime) %in% 2:6) %>% # only weekdays
+#   mutate(mnth_trip = floor_date(starttime, unit = "months"),
+#          day_trip = floor_date(starttime, unit = "days")) %>% 
+#   semi_join(valid_stations, by = "startstationid")
+# 
+# test <- d_filt %>% 
+#   count(mnth_trip, startstationid) %>% 
+#   spread(startstationid, n) %>% 
+#   gather("startstationid","n", -mnth_trip, na.rm = FALSE) %>% 
+#   group_by(startstationid) %>% 
+#   arrange(startstationid, mnth_trip) %>% 
+#   mutate(new = !is.na(n) & is.na(lag(n)),
+#          removed = is.na(n) & !is.na(lag(n)),
+#          changed = new | removed
+#          )
+# 
+# test %>% 
+#   group_by(mnth_trip) %>% 
+#   summarise_at(vars(new, removed, changed), sum) %>% 
+#   arrange(desc(new))
+# 
+# test %>% 
+#   filter(mnth_trip == '2015-08-01') %>% 
+#   filter(new)
+
+focus_stations <- c('3427','251','151')
+
+d_filt %>% 
+  count(day_trip,startstationid) %>% 
+  filter(day_trip >='2016-04-01') %>% 
+  filter(startstationid %in% focus_stations) %>% 
+  ggplot(aes(day_trip, n)) + 
+  geom_point(aes(color = startstationid), alpha = .3) + 
+  geom_smooth(aes(color = startstationid), method = "loess", se = F)
+
+
+
+sbbox <- make_bbox(lon = d_filt$startstationlongitude, lat = d_filt$startstationlatitude, f = .1)
+
+sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE)
+
+ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, 
+                 y = startstationlatitude, 
+                 size = n, color = startstationid %in% focus_stations), 
+             alpha = 0.3, 
+             data = mapping_data %>% semi_join(valid_stations, by = c("startstationid"))) + 
+  facet_wrap(~day_trip, ncol = 5) +
+  theme_inset()
+
+```
+
+```{r}
+
+map_data2 <- mapping_data %>% filter(day_trip == max(day_trip)) %>% 
+  distinct(startstationlatitude, startstationlongitude, .keep_all = TRUE) 
+
+map_data2 <- map_data2 %>% 
+  split(.$startstationid) %>% 
+  purrr::map(.f = 
+               function(x){
+                 x[rep(1,x$n[1]), ]
+               }) %>% 
+  bind_rows()
+
+ggmap(sq_map) +
+  geom_density_2d(aes(x = startstationlongitude, 
+                 y = startstationlatitude,
+             color = ..level..), 
+             data = map_data2) +
+  theme_inset()
+
+```
+
+
+
+```{r}
+
+stat_clean <- stations %>%
+  semi_join(valid_stations, by = "startstationid") %>% 
+  select(id = startstationid,
+         lat = startstationlatitude,
+         lon = startstationlongitude) %>% 
+  mutate(k = 1)
+
+stat_clean <- inner_join(stat_clean, stat_clean, by = "k") %>% 
+  select(-k)
+
+station_distance <- stat_clean %>% 
+  mutate(dist = gcd_slc(lon.x, lat.x, lon.y, lat.y)) %>% 
+  filter(id.x!=id.y)
+
+station_distance %>% 
+  ggplot(aes(dist)) + 
+  geom_histogram(binwidth = .25)
+
+station_distance %>% 
+  filter(id.x == '3427') %>% 
+  ggplot(aes(dist)) + 
+  geom_histogram(binwidth = .25)
+
+station_distance %>% 
+  filter(id.x == '3427') %>% 
+  arrange(dist)
+
+```
+
+## Create a grid of manhattan
+
+```{r}
+
+library(rgeos)
+library(sp)
+library(rgdal)
+
+map <-readOGR("shape/geo_export_aff6db45-f12b-4411-b5c1-b3cd0af55950.shp")
+
+data_grid <- expand.grid(lat = seq(sbbox['bottom'], sbbox['top'], by = .002),
+                        lon = seq(sbbox['left'],sbbox['right'], by = .002))
+coordinates(data_grid) <- ~lon + lat
+
+proj4string(data_grid) <- proj4string(map)
+
+final_grid <- cbind(over(data_grid, map),as.data.frame(data_grid))
+
+# final_grid
+ggmap(sq_map) +
+  geom_point(aes(x = lon, y = lat, color  = boro_name), alpha = 0.7, data = final_grid)  +
+  theme(axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  coord_map()
+```
+
+## Get ACS Shape File
+```{r}
+acs_map <- rgdal::readOGR("acs_shape/cb_2016_36_puma10_500k.shp")
+
+data_grid <- expand.grid(lat = seq(sbbox['bottom'], sbbox['top'], by = .002),
+                        lon = seq(sbbox['left'],sbbox['right'], by = .002))
+
+
+coordinates(data_grid) <- ~lon + lat
+
+proj4string(data_grid) <- proj4string(acs_map)
+
+final_grid <- cbind(over(data_grid, acs_map),as.data.frame(data_grid))
+
+# final_grid
+ggmap(sq_map) +
+  geom_point(aes(x = lon, y = lat, color  = boro_name), alpha = 0.7, data = final_grid)  +
+  theme(axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  coord_map()
+
+
+install.packages('acs')
+library(acs)
+
+acs::acs.lookup()
+final_grid %>% glimpse
+
+```
+
+
+
+## Number of spots in each station
+
+```{r}
+# bikes_left <- d_filt %>% group_by(day_trip, startstationid) %>% count() %>%  mutate(n = -n)
+# bikes_added <- d_filt %>% mutate(endstationid = as.character(endstationid)) %>% group_by(day_trip, endstationid) %>% count()
+# 
+# bikes_left %>% left_join(bikes_added, by = c('day_trip','startstationid' = 'endstationid')) %>% 
+#   mutate(avail_bikes = -1*(n.x+n.y)) %>% 
+#   group_by(startstationid) %>% 
+#   summarise(mean_bikes = mean(avail_bikes, na.rm = TRUE),
+#             max_bikes = max(avail_bikes, na.rm = TRUE)) %>% 
+#   ggplot(aes(max_bikes)) + geom_histogram()
+
+```
+
+
+
+# Regression 
+
+```{r}
+subset_weather <- d_filt %>% 
+  # filter(startstationid %in% focus_stations) %>% 
+  filter(day_trip >='2014-01-01') %>% 
+  count(day_trip,startstationid)
+
+
+subset_weather <- subset_weather %>% left_join(weather_data) %>% 
+  mutate(days = day_trip-min(day_trip),
+         days = as.numeric(days, unit = "days"))
+
+subset_weather <- subset_weather %>% 
+  left_join(bike_dock_data, by = c("startstationid" = "dock_id",
+                                   "day_trip" = "date_log")) %>% 
+  filter(!is.na(tot_docks))
+# 
+# 
+# subset_weather <- subset_weather %>% 
+#   mutate_at(vars(PRCP:TMAX, days, avail_bikes, min_avail), funs(as.numeric(scale(.))))
+# 
+
+l_s <- function(x){ scale(log(x))}
+
+
+basic_mod <- glmer(n ~ scale(PRCP) + scale(SNOW) + scale(SNWD) + #TMIN + 
+                     scale(log(TMAX)) + scale(avail_bikes) + scale(min_avail) +  
+                     (1|startstationid) + scale(days) + scale(lag(n)), data = subset_weather, family = poisson)
+basic_mod %>% 
+  summary()
+
+predict.merMod
+
+subset_weather <- subset_weather %>% 
+  mutate(fitted_vals = predict(basic_mod, ., type = "response")) 
+
+
+subset_weather %>% 
+  filter(startstationid %in% focus_stations) %>% 
+  ggplot(aes(day_trip, n)) + 
+  geom_point(aes(color = startstationid), alpha = .3) + 
+  geom_smooth(aes(color = startstationid), se = F,method = "gam",formula = y ~ s(x, bs = "cs"))
+
+subset_weather %>% 
+  filter(startstationid %in% focus_stations) %>% 
+  ggplot(aes(day_trip, n-fitted_vals)) + 
+  geom_point(aes(color = startstationid), alpha = .3) + 
+  geom_smooth(aes(color = startstationid), se = F, method = "gam",formula = y ~ s(x, bs = "cs")) +
+  geom_hline(yintercept = 0, linetype = "longdash", color = "grey30")
+
+subset_weather %>% 
+  ggplot(aes(x = fitted_vals , y = fitted_vals - n, color = startstationid)) + 
+  geom_point() + 
+  geom_smooth(method = "lm")
+
+```
+
+# Main Analysis 
+
+
+```{r}
+daily_vario <- d_filt %>% 
+  filter(day_trip == '2017-06-01') %>% 
+  group_by(startstationid, startstationlatitude,startstationlongitude) %>% 
+  summarise(n = n()) %>% 
+  ungroup()
+
+daily_vario %>% 
+  select(id = startstationid,
+         lat = startstationlatitude,
+         lon = startstationlongitude,
+         n) %>% 
+  mutate(k = 1) %>% 
+  inner_join(.,.,by = 'k') %>% 
+  filter(id.x != id.y) %>% 
+  mutate(dist = gcd_slc(lon.x, lat.x, lon.y, lat.y)) %>% 
+  mutate(cut_dist = cut(dist, seq(0,8, by = 0.25))) %>% 
+  mutate(delta_squared = (n.y-n.x)^2) %>% 
+  group_by(cut_dist) %>% 
+  summarise(var1 = mean(delta_squared)/2,
+            ct = n()) %>% 
+  ggplot(aes(x = cut_dist, y = var1,size = ct)) + geom_point() + coord_flip()
+
+```
+
+# Variograms using package
+```{r}
+library(sp)
+library(gstat)
+coordinates(daily_vario) <- c("startstationlongitude", "startstationlatitude")
+variogram(log(n)~1, daily_vario, cloud = TRUE) %>% 
+  plot(cloud = TRUE)
+
+variogram(log(n)~1, daily_vario) %>% 
+  plot(cloud = FALSE)
+
+```
+
+
+
+
