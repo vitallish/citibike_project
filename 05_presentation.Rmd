@@ -466,6 +466,18 @@ plot(vt2, vfit2)
 ```
 </div>
 
+# Next Steps
+
+## Further Analysis
+
+### Regression
+
+> - Group a month before and a month after and compare the difference, model that as distance from new station.
+
+### Spatial Analysis
+
+> - How can we tell if a predictor is 'significant'?
+
 
 <!-- ```{r} -->
 <!-- library(purrr) -->
