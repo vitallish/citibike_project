@@ -154,12 +154,15 @@ station_flow %>%
 #   mutate(weekend = wday(starttime) %in% 2:6)
 
 
+
 d_filt <- all_data %>%
   mutate_at(vars(startstationid,endstationid), as.character) %>% 
   filter(between(hour(starttime), 6, 10)) %>% # only rides that start between 6 and 10 am
   filter(wday(starttime) %in% 2:6) %>% # only weekdays
   mutate(mnth_trip = floor_date(starttime, unit = "months"),
          day_trip = floor_date(starttime, unit = "days")) 
+
+save(d_filt, file = 'transformed_data/citibike_rides.Rdata')
 
 d_filt %>% 
   # count(mnth_trip, startstationname) %>% 
@@ -411,6 +414,15 @@ ggmap(sq_map) +
         axis.ticks = element_blank(),
         axis.text = element_blank()) + 
   coord_map()
+
+
+coordinates(stations2) <- ~startstationlongitude + startstationlatitude
+
+proj4string(stations2) <- proj4string(map)
+
+stations2 <- cbind(over(stations2, map),as.data.frame(stations2))
+
+
 ```
 
 ## Get ACS Shape File
@@ -441,6 +453,11 @@ library(acs)
 
 acs::acs.lookup()
 final_grid %>% glimpse
+
+stations2
+
+readr::write_csv(stations2,path = "transformed_data/labeled_stations.csv")
+
 
 ```
 
@@ -491,7 +508,8 @@ l_s <- function(x){ scale(log(x))}
 
 basic_mod <- glmer(n ~ scale(PRCP) + scale(SNOW) + scale(SNWD) + #TMIN + 
                      scale(log(TMAX)) + scale(avail_bikes) + scale(min_avail) +  
-                     (1|startstationid) + scale(days) + scale(lag(n)), data = subset_weather, family = poisson)
+                     (1|startstationid) + scale(days) + scale(lag(n)), 
+                   data = subset_weather, family = poisson)
 basic_mod %>% 
   summary()
 

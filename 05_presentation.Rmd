@@ -15,6 +15,7 @@ knitr::opts_chunk$set(echo = FALSE,
                       warning = FALSE,
                       # cache = TRUE,
                       fig.align = 'center', 
+                      # fig.height = 6,
                       dev.args = list(bg = 'transparent'))
 
 library(ggplot2)
@@ -31,11 +32,16 @@ library(ggmap)
 library(stringr)
 library(lme4)
 
+library(lattice)
+library(sp)
+library(gstat)
+
 source('../stat 787 - hw/helper_functions.R')
 
-
+theme_set(theme_minimal())
+theme_update(panel.grid.minor = element_blank())
 theme_update(plot.background = element_rect(fill = "transparent", color = NA))
-
+theme_update(legend.position = "bottom")
 ```
 
 ```{r load_data}
@@ -45,6 +51,10 @@ labeled_stations <-
   read_csv(
     'transformed_data/labeled_stations.csv',
     col_types = cols(
+        boro_name = col_character(),
+  boro_code = col_integer(),
+  shape_leng = col_double(),
+  shape_area = col_double(),
       startstationid = col_character(),
       startstationname = col_character(),
       startstationlatitude = col_double(),
@@ -54,6 +64,7 @@ labeled_stations <-
   )
 
 ```
+
 
 ## Overview
 
@@ -104,17 +115,436 @@ Stations:
 nrow(labeled_stations)
 ```
 
-## Citibike Data | Summary Statistics {.build}
+## Citibike Data | Exploration {.build}
+
+<div class="columns-2">
+
+```{r explore-citi, out.width="100%", fig.height=6, fig.width = 6}
+
+station_cts <- d_filt %>% 
+  select(mnth_trip, startstationid) %>% 
+  left_join(labeled_stations, by = "startstationid") %>% 
+  group_by(mnth_trip,boro_name) %>% 
+  summarise(stations = n_distinct(startstationid),
+            rides = n())
+
+station_cts %>% 
+  ggplot(aes(x = mnth_trip, y = rides, color = boro_name)) + geom_line(stat = "identity") +
+  labs( title = "Monthly Citibike Rides",
+        x = "Month",
+        y = "Number of Rides",
+        color = "") +
+  ylim(c(0,NA))
+
+```
+
+```{r explore-ctit-3, out.width="100%", fig.height=6, fig.width = 6}
+
+station_cts %>% 
+  ggplot(aes(x = mnth_trip, y = stations, fill = boro_name)) + geom_bar(stat = "identity") +
+  labs( title = "Total Citibike Stations",
+        x = "Month",
+        y = "Number of Stations",
+        fill = "")
+
+```
+
+</div>
+
+
+## Citibike Data | Exploration (Cont.) {.build}
+
+```{r, cache=TRUE}
+
+daily_cts <- d_filt %>% 
+  count(day_trip, startstationid) 
+
+
+sbbox <- with(labeled_stations, 
+              make_bbox(lon = startstationlongitude, lat = startstationlatitude, f = .1)
+)
+
+suppressMessages(sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE))
 
 
 
+samp_days <- as.POSIXct(c("2015-07-01", "2016-01-04", "2016-07-01","2017-07-03"))
+  
 
+mapping_data <- daily_cts %>% 
+  spread(startstationid, n, fill = NA) %>% 
+  gather("startstationid","n", -day_trip) %>% 
+  left_join(labeled_stations, by = "startstationid") %>% 
+  filter(day_trip %in% samp_days) %>% 
+  filter(startstationlongitude != 0) %>% 
+  filter(!is.na(n)) %>% 
+  mutate(state = "new york")
+
+ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, size = n, color = boro_name), 
+             alpha = 0.3, data = mapping_data) + facet_wrap(~day_trip, nrow = 1) +
+  theme_inset() + labs(title = "Daily Ridership Through the Years")
+```
+
+
+## Citibike Data {.build}
+
+<div class="columns-2">
+
+```{r, fig.width=3, fig.height = 6}
+ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, color = cluster), 
+             data = labeled_stations) +
+  theme_inset()+
+labs(title= "Clustered Stations")
+  
+```
+
+- Only  the stations labeled in red will be used in the analysis.
+
+- These stations have the largest amount of longitudinal data and are more homogenous in the surrounding area.
+
+- Start analysis in 2014, giving 6 months "burn in"
+
+```{r, cache = TRUE}
+labeled_stations <- labeled_stations %>% filter(cluster == 1)
+
+
+labeled_stations <- labeled_stations %>% 
+  distinct(startstationid, .keep_all = TRUE)
+
+
+stat_clean <- labeled_stations %>%
+  select(id = startstationid,
+         lat = startstationlatitude,
+         lon = startstationlongitude) %>% 
+  mutate(k = 1)
+
+stat_clean <- inner_join(stat_clean, stat_clean, by = "k") %>% 
+  select(-k)
+
+station_distance <- stat_clean %>% 
+  mutate(dist = gcd_slc(lon.x, lat.x, lon.y, lat.y)) %>% 
+  filter(id.x!=id.y)
+
+rm(stat_clean)
+
+d_filt <- d_filt %>% 
+  semi_join(labeled_stations, by = "startstationid") %>% 
+  filter(day_trip >= '2014-01-01')
+
+
+sbbox <- with(labeled_stations, 
+              make_bbox(lon = startstationlongitude, lat = startstationlatitude, f = .1)
+)
+
+suppressMessages(sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE))
+
+
+```
+
+</div>
 
 ## Historic Weather Data
 
 ### [NOAA Data Request](https://www.ncdc.noaa.gov/cdo-web/)
 
+```{r}
 
+weather_data <- read_csv(
+  'weather_data/NYC_20130101-20170731.csv',
+  col_types = cols(
+    .default = col_integer(),
+    STATION = col_character(),
+    NAME = col_character(),
+    DATE = col_character(),
+    AWND = col_double(),
+    PGTM = col_character(),
+    PRCP = col_double(),
+    SNOW = col_double(),
+    TAVG = col_character(),
+    WSF2 = col_double(),
+    WSF5 = col_double()
+  )
+)
+weather_data <- weather_data %>%
+  mutate(day_trip = mdy(DATE),
+         day_trip = as.POSIXct(day_trip)) %>%
+  select(day_trip, PRCP, SNOW, SNWD, TMIN, TMAX)
+
+weather_data %>% glimpse
+```
+
+## Subway Entrance Data 
+
+[Subway Entrance Data](https://data.ny.gov/Transportation/NYC-Transit-Subway-Entrance-And-Exit-Data/i9wp-a4ja)
+
+```{r}
+subway_data <-
+  read_csv(
+    'subway_data/NYC_Transit_Subway_Entrance_And_Exit_Data.csv',
+    col_types = cols(
+      .default = col_character(),
+      `Station Latitude` = col_double(),
+      `Station Longitude` = col_double(),
+      Route8 = col_integer(),
+      Route9 = col_integer(),
+      Route10 = col_integer(),
+      Route11 = col_integer(),
+      ADA = col_logical(),
+      `Free Crossover` = col_logical(),
+      `Entrance Latitude` = col_double(),
+      `Entrance Longitude` = col_double()
+    )
+    
+  )
+
+subway_data <- subway_data %>% 
+  select(subway_name = `Station Name`, 
+         subway_lat = `Station Latitude`,
+         subway_long = `Station Longitude`) %>% 
+  distinct()
+
+subway_data2 <- labeled_stations %>% 
+  mutate(k = 1) %>% 
+  inner_join(subway_data %>% mutate(k = 1), by = "k") %>% 
+  mutate(dist = gcd_slc(startstationlongitude, startstationlatitude, 
+                        subway_long, subway_lat)) %>% 
+  group_by(startstationid) %>% 
+  summarise(closest_subway = min(dist),
+            close_subways = sum(dist <=0.5))
+ 
+labeled_stations <- labeled_stations %>% 
+  left_join(subway_data2,by = "startstationid")
+ 
+```
+
+
+<div class="columns-2">
+
+```{r explore-subway, out.width="100%", fig.height=6, fig.width = 6}
+
+labeled_stations %>% 
+  ggplot(aes(x = closest_subway)) + geom_histogram(binwidth = 0.05) +
+  labs(title = "Closest Subway to Citibike (KM)",
+       x = "Distance to Closest Subway")
+
+```
+
+```{r explore-subway-2, out.width="100%", fig.height=6, fig.width = 6}
+
+labeled_stations %>% 
+  ggplot(aes(x = close_subways)) + geom_histogram(binwidth = 1) +
+  labs(title = "Subway Stations within 0.5 KM",
+       x = "Number of Close Subway Stations")
+
+```
+
+</div>
+# Regression Analysis
+
+
+## Model Definition
+
+- Fit a hierarchical Poisson model to control for variability throughout the year.
+
+> -  Outcome - Number of Rides 
+
+### Coefficients:
+
+> - Fixed: Temperature, Snow, Days from Jan 1, 2014, previous Days count
+> - Random: Station, Week of Year
+
+```{r}
+regression_data <- d_filt %>% 
+  count(day_trip,startstationid) %>% 
+  left_join(weather_data, by = "day_trip") %>% 
+  mutate(days = day_trip-min(day_trip),
+         days = as.numeric(days, unit = "days")) %>% 
+  mutate(week_num = week(day_trip))
+```
+
+
+```{r, cache = TRUE}
+basic_mod <- glmer(n ~ scale(PRCP) + scale(SNOW) + scale(SNWD) + #TMIN + 
+                     scale(log(TMAX)) + (1|startstationid) +(1|week_num)+scale(log(days + 1)) + scale(lag(n))
+                   # + cos(2*pi*days) + sin(2 * pi*days) 
+                     + I(cos(2*pi*days/365)) + I(sin(2 * pi*days/365))
+                   # + cos(2*pi*days/30) + sin(2 * pi*days/30)
+                   , 
+                   data = regression_data, family = poisson)
+
+int_only_mod <-glmer(n ~ (1|startstationid), 
+                   data = regression_data, family = poisson)
+
+regression_data <- regression_data %>% 
+  mutate(full_fit = predict(basic_mod, ., type = "response"),
+         simple_fit = predict(int_only_mod, ., type = "response"),
+         full_resid = n - full_fit)
+```
+
+## Model Performance 
+
+```{r}
+regression_data %>% 
+  filter(startstationid %in% c('151')) %>% 
+  ggplot(aes(x = day_trip)) + 
+    geom_smooth(aes(y = n - simple_fit, color = "Average"), alpha = 0.5, method = "loess", span = 0.2)+
+  geom_smooth(aes( y = n-full_fit, color = "Full Regression"), alpha = 0.5, method = "loess", span = 0.2)  +
+  scale_color_manual(
+    name = "",
+    values = c("#999999","#D55E00"),
+    labels = c("Average", "Full Regression")
+  ) +
+  labs(y = "Smoothed Residuals",
+       x = "Date",
+       title = "Regression Model Performance")
+
+```
+
+
+## Specific Group of Stations
+
+```{r}
+regression_data %>% 
+  filter(startstationid %in% c('3427','251','151')) %>% 
+  filter(day_trip >= '2015-01-01') %>% 
+  ggplot(aes(x = day_trip, y = full_resid, color = startstationid)) +
+    geom_smooth(span = 0.2, method = "loess") +
+  labs(title = "New Station's Effect on Surrounding Stations",
+       y = "Smoothed Residuals",
+       x = "Day of Trip",
+       color = "Station ID")
+```
+
+
+# Spatial Analysis
+
+## Models
+
+Does proximity to subway stations show decrease in Citibike usage?
+
+```{r}
+spatial_data <- d_filt %>% 
+  count(day_trip, startstationid) %>% 
+  inner_join(labeled_stations, by = "startstationid")
+
+single_day <- spatial_data %>% 
+  filter(day_trip =='2016-07-01') %>% 
+  filter( n < quantile(n, .99))
+
+ggmap(sq_map) + 
+  geom_point(aes(x = subway_long, y= subway_lat), data = subway_data) + 
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, color = n, size = n), 
+             alpha = 0.7, data = single_day) +
+  theme_inset() +
+  labs(title = "Citibike Ridership on July 1st, 2016,\nwith subway stations overlaid.")
+
+coordinates(single_day) <- c("startstationlongitude", "startstationlatitude")
+```
+
+## Fitting the Variogram
+<div class = "columns-2">
+
+### No Regressors
+
+```{r, out.width="100%", fig.height=5, fig.width = 5}
+vgm_sel <- vgm(.3, c("Sph"), nugget = 0.01)
+
+vt <- variogram(log(n+1) ~ 1, single_day, cutoff = .020, width = .020/15)
+vfit <- (fit.variogram(vt, vgm_sel))
+plot(vt, vfit)
+```
+
+### Closest Subway Features
+
+```{r, out.width="100%", fig.height=5, fig.width = 5}
+vt2 <- variogram(log(n+1) ~ sqrt(closest_subway) + log(close_subways + 1), single_day, cutoff = 0.020, width = .020/15)
+vfit2 <- (fit.variogram(vt2, vgm_sel))
+plot(vt2, vfit2)
+
+```
+</div>
+
+
+<!-- ```{r} -->
+<!-- library(purrr) -->
+<!-- set.seed(1) -->
+<!-- out <- spatial_data %>%  -->
+<!--   left_join(regression_data %>% select(day_trip, startstationid, full_resid)) %>%  -->
+<!--   select(-n) %>%  -->
+<!--   rename(n = full_resid) %>%  -->
+<!--   filter(!is.na(n)) %>%  -->
+<!--   filter(day_trip %in% sample(day_trip, 10)) %>%  -->
+<!--   # filter(n<200) %>%  -->
+<!--    nest(-day_trip) %>%  -->
+<!--   mutate(data = map(data, function(x){ -->
+<!--     coordinates(x) <- c("startstationlongitude", "startstationlatitude") -->
+<!--     x}), -->
+<!--     vt = map(data, ~variogram(n ~ sqrt(closest_subway), .x, cutoff = 1/100, width = .5/100/15)), -->
+<!--     vfit = map(vt, ~fit.variogram(.x, vgm(.3, c("Exp"), nugget = .01))), -->
+<!--     krige_cv = map2(data, vfit, ~krige.cv(n ~sqrt(closest_subway), .x, .y, nfold = 5, verbose = FALSE)), -->
+<!--     df = map(vfit, as.data.frame))  -->
+
+<!-- out$krige_cv[[1]]$zscore %>%  -->
+<!--   var() -->
+
+
+
+
+<!-- bind_rows( -->
+<!-- out %>% select(day_trip, model, val = psill) %>% mutate(var = "psill"), -->
+<!-- out %>% select(day_trip, model, val = range) %>% mutate(var = "range") -->
+<!-- ) %>%  -->
+<!--   group_by(model, var) %>%  -->
+<!--   summarise(mean(val), -->
+<!--             median(val), -->
+<!--             low = quantile(val,.05), -->
+<!--             high = quantile(val, .95)) -->
+
+
+<!-- bind_rows( -->
+<!-- out %>% select(day_trip, model, val = psill) %>% mutate(var = "psill"), -->
+<!-- out %>% select(day_trip, model, val = range) %>% mutate(var = "range") -->
+<!-- )  -->
+
+
+<!-- krige(n ~ sqrt(closest_subway), out$data[[1]]) -->
+
+
+<!-- out  %>%  -->
+<!--   ggplot(aes(psill, range)) + geom_point() + facet_wrap(~model) -->
+
+
+<!--   ggplot(aes(x = val)) + geom_histogram() + facet_grid(model ~ var, scales = "free") + scale_x_log10() -->
+
+<!--   group_by(model, var) %>%  -->
+<!--   summarise(mean(val), -->
+<!--             median(val), -->
+<!--             low = quantile(val,.05), -->
+<!--             high = quantile(val, .95)) -->
+
+<!-- library(modelr) -->
+
+<!-- spatial_data %>%  -->
+<!--   left_join(regression_data %>% select(day_trip, startstationid, full_resid)) %>%  -->
+<!--   select(-n) %>%  -->
+<!--   rename(n = full_resid) %>%  -->
+<!--   filter(!is.na(n)) %>%  -->
+<!--   nest(-day_trip) %>%  -->
+<!--   modelr::crossv_kfold() -->
+<!--   # filter(day_trip %in% sample(day_trip, 10)) %>%  -->
+
+
+<!--   nest() %>% mutate(data = map(data, function(x){ -->
+<!--     coordinates(x) <- c("startstationlongitude", "startstationlatitude") -->
+<!--     x}), -->
+<!--     vt = map(data, ~variogram(n ~ sqrt(closest_subway), .x, cutoff = 1/100, width = .5/100/15)), -->
+<!--     vfit = map(vt, ~fit.variogram(.x, vgm(.3, c("Exp"), nugget = .01))), -->
+<!--     df = map(vfit, as.data.frame)) %>%  -->
+<!--   unnest(df)  -->
+
+<!-- ``` -->
 
 
 
