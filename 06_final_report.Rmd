@@ -1,0 +1,402 @@
+---
+title: "Citibike Station Use"
+subtitle: "STAT 787"
+author: "Vitaly Druker"
+date: "December 20th, 2017"
+output: 
+  bookdown::pdf_document2:
+    toc: true
+bibliography: bibliography.bib
+---
+
+
+```{r setup, include=FALSE}
+# to enable presenter mode add ?presentme=true to the URL of the presentation
+
+knitr::opts_chunk$set(echo = FALSE,
+                      comment = NA,
+                      warning = FALSE,
+                      # cache = TRUE,
+                      fig.align = 'center', 
+                      fig.height = 6,
+                      fig.width = 6,
+                      dev.args = list(bg = 'transparent'))
+
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(knitr)
+library(pander)
+library(tibble)
+options(tibble.print_max = 5)
+
+library(readr)
+library(tidyr)
+library(ggmap)
+library(stringr)
+library(lme4)
+
+library(lattice)
+library(sp)
+library(gstat)
+library(broom)
+
+source('../stat 787 - hw/helper_functions.R')
+
+theme_set(theme_minimal())
+theme_update(panel.grid.minor = element_blank())
+theme_update(plot.background = element_rect(fill = "transparent", color = NA))
+theme_update(legend.position = "bottom")
+```
+
+```{r load_data}
+load('transformed_data/citibike_rides.Rdata')
+
+labeled_stations <-
+  read_csv(
+    'transformed_data/labeled_stations.csv',
+    col_types = cols(
+        boro_name = col_character(),
+  boro_code = col_integer(),
+  shape_leng = col_double(),
+  shape_area = col_double(),
+      startstationid = col_character(),
+      startstationname = col_character(),
+      startstationlatitude = col_double(),
+      startstationlongitude = col_double(),
+      cluster = col_character()
+    )
+  )
+
+```
+
+# Introduction 
+
+The CitiBike project [@citibike] is a bike sharing program started in NYC in 2014. It has been considered successful and continues to grow every few years by adding new stations to existing neighborhoods and expanding to new ones. 
+
+There are many different factors that account for where Citibike stations should be placed. One prevailing theory is that they should be placed near subways so that commuters are able to piggyback their bike trip off of other forms of transit. [@nacto]
+
+Another theory brought forward in this study is that it's better to place CitiBike stations in a high concentration. The theory behind this is that more stations allow riders to have more choices in stations in case a particular station is out of bikes.
+
+The report below will use spatial analysis and regression techniques to test both of these statements.
+
+
+# Data Sources
+
+
+## Citibike Data 
+
+CitiBike data is available online for free download [@citibike]. Data is available for each ride taken and includes start/stop times, start/stop stations along with some basic ridership information. A small sample of the data is shown below:
+
+```{r}
+d_filt %>% 
+  select(-startstationlatitude, -startstationlongitude, 
+         -endstationlatitude, -endstationlongitude,
+         -mnth_trip, -day_trip) %>% 
+  glimpse
+```
+
+While the data is extensive, this report will only look at a single day worth of data. Nevertheless some graphs described below show some interesting views of the data to help the reader visualize the general feel of the data.
+
+Figure \@ref(fig:explore-citi) shows some general ridership statistics for CitiBike usage over time. The figure on the left demonstrates both seasonal variability in ridership along with a steady increase in general ridership. The figure on the right shows that the number of stations per station has not increased linearly, but happens in spurts and generally coincides with breaking out into a new neighborhood.
+
+Figure \@ref(fig:station-ridership) echoes much of what was shown in Figure \@ref(fig:explore-citi), but plotted on a map for a few select days. Ridership is lower in the winter, and there was a clear expansion the 1st and 2nd panel, along with between the 3rd and 4th panel. 
+
+(ref:explore-citi) The two graphs above show general information about CitiBike ridership. _Left_: The graph shows monthly rides by NYC borough. _Right_: The number of unique stations in a given month broken out by borough.
+
+```{r explore-citi, out.width="49%", fig.height=6, fig.width = 6, fig.show='hold', fig.cap = "(ref:explore-citi)"}
+
+station_cts <- d_filt %>% 
+  select(mnth_trip, startstationid) %>% 
+  left_join(labeled_stations, by = "startstationid") %>% 
+  group_by(mnth_trip,boro_name) %>% 
+  summarise(stations = n_distinct(startstationid),
+            rides = n())
+
+station_cts %>% 
+  ggplot(aes(x = mnth_trip, y = rides, color = boro_name)) + geom_line(stat = "identity") +
+  labs( title = "Monthly Citibike Rides",
+        x = "Month",
+        y = "Number of Rides",
+        color = "") +
+  ylim(c(0,NA))
+
+station_cts %>% 
+  ggplot(aes(x = mnth_trip, y = stations, fill = boro_name)) + geom_bar(stat = "identity") +
+  labs( title = "Total Citibike Stations",
+        x = "Month",
+        y = "Number of Stations",
+        fill = "")
+
+```
+
+(ref:station-ridership) The figure above shows 4 days of CitiBike usage. Each dot represents a station and the size of each dot is proportional to the number of rides taken from that station.
+
+```{r station-ridership, cache=TRUE, fig.cap = "(ref:station-ridership)"}
+
+daily_cts <- d_filt %>% 
+  count(day_trip, startstationid) 
+
+
+sbbox <- with(labeled_stations, 
+              make_bbox(lon = startstationlongitude, lat = startstationlatitude, f = .1)
+)
+
+suppressMessages(sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE))
+
+
+
+samp_days <- as.POSIXct(c("2015-07-01", "2016-01-04", "2016-07-01","2017-07-03"))
+  
+
+mapping_data <- daily_cts %>% 
+  spread(startstationid, n, fill = NA) %>% 
+  gather("startstationid","n", -day_trip) %>% 
+  left_join(labeled_stations, by = "startstationid") %>% 
+  filter(day_trip %in% samp_days) %>% 
+  filter(startstationlongitude != 0) %>% 
+  filter(!is.na(n)) %>% 
+  mutate(state = "new york")
+
+ggmap(sq_map) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, size = n, color = boro_name), 
+             alpha = 0.3, data = mapping_data) + facet_wrap(~day_trip, nrow = 1) +
+  theme_inset() + labs(title = "Daily Ridership Through the Years")
+```
+
+
+```{r, cache = TRUE}
+labeled_stations <- labeled_stations %>% filter(cluster == 1)
+
+
+labeled_stations <- labeled_stations %>% 
+  distinct(startstationid, .keep_all = TRUE)
+
+
+stat_clean <- labeled_stations %>%
+  select(id = startstationid,
+         lat = startstationlatitude,
+         lon = startstationlongitude) %>% 
+  mutate(k = 1)
+
+stat_clean <- inner_join(stat_clean, stat_clean, by = "k") %>% 
+  select(-k)
+
+station_distance <- stat_clean %>% 
+  mutate(dist = gcd_slc(lon.x, lat.x, lon.y, lat.y)) %>% 
+  filter(id.x!=id.y)
+
+rm(stat_clean)
+
+d_filt <- d_filt %>% 
+  semi_join(labeled_stations, by = "startstationid") %>% 
+  filter(day_trip >= '2014-01-01')
+
+
+sbbox <- with(labeled_stations, 
+              make_bbox(lon = startstationlongitude, lat = startstationlatitude, f = .1)
+)
+
+suppressMessages(sq_map <- get_map(sbbox,source = 'stamen', maptype = "terrain-lines", messaging = FALSE))
+
+
+```
+
+Station density data will be estimated by looking at the number of stations within 0.5 kms, which can be used as a good approximation of how far people are willing to walk. Figure \@ref(fig:station-density) shows the distribution of the number of nearby stations.
+
+(ref:station-density) Histogram of number of close stations.
+
+```{r station-density, fig.cap="(ref:station-density)", out.width = "49%", fig.show='hold'}
+station_density <- station_distance %>% 
+  group_by(id.x) %>% 
+  summarise(close_citibike = sum(dist <= .5),
+            closest_citi = min(dist, na.rm = TRUE))
+  
+station_density %>% 
+    ggplot(aes(x = closest_citi)) + geom_histogram(binwidth = 0.05) +
+  labs(title = "Closest Cititibike to Citibike Station (KM)",
+       x = "Distance to Closest Citibike Station")
+
+station_density %>% 
+  ggplot(aes(x = close_citibike)) + 
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Citibike Stations Density",
+       x = "Number of Stations within 0.5 kms")
+
+```
+
+
+## Subway Entrance Data 
+
+Subway Entrance Data was used to estimate the number of close subway stations along with the distance to the nearest station. The analysis is the same as what was done for identifying the closest CitiBike stations. Data was pulled from the MTA website [@subway]. Figure \@ref(fig:explore-subway) shows similar data to that above.
+
+```{r}
+subway_data <-
+  read_csv(
+    'subway_data/NYC_Transit_Subway_Entrance_And_Exit_Data.csv',
+    col_types = cols(
+      .default = col_character(),
+      `Station Latitude` = col_double(),
+      `Station Longitude` = col_double(),
+      Route8 = col_integer(),
+      Route9 = col_integer(),
+      Route10 = col_integer(),
+      Route11 = col_integer(),
+      ADA = col_logical(),
+      `Free Crossover` = col_logical(),
+      `Entrance Latitude` = col_double(),
+      `Entrance Longitude` = col_double()
+    )
+    
+  )
+
+subway_data <- subway_data %>% 
+  select(subway_name = `Station Name`, 
+         subway_lat = `Station Latitude`,
+         subway_long = `Station Longitude`) %>% 
+  distinct()
+
+subway_data2 <- labeled_stations %>% 
+  mutate(k = 1) %>% 
+  inner_join(subway_data %>% mutate(k = 1), by = "k") %>% 
+  mutate(dist = gcd_slc(startstationlongitude, startstationlatitude, 
+                        subway_long, subway_lat)) %>% 
+  group_by(startstationid) %>% 
+  summarise(closest_subway = min(dist),
+            close_subways = sum(dist <=0.5))
+ 
+labeled_stations <- labeled_stations %>% 
+  left_join(subway_data2,by = "startstationid") %>% 
+  left_join(station_density, by = c("startstationid" = "id.x"))
+ 
+```
+
+(ref:explore-subway) A histogram of the distance to the nearest subway, along with the number of stations within 0.5 kms.
+
+```{r explore-subway, out.width="49%", fig.height=6, fig.width = 6, fig.cap = "(ref:explore-subway)", fig.show = 'hold'}
+
+labeled_stations %>% 
+  ggplot(aes(x = closest_subway)) + geom_histogram(binwidth = 0.05) +
+  labs(title = "Closest Subway to Citibike (KM)",
+       x = "Distance to Closest Subway")
+
+
+labeled_stations %>% 
+  ggplot(aes(x = close_subways)) + geom_histogram(binwidth = 1) +
+  labs(title = "Subway Stations within 0.5 KM",
+       x = "Number of Close Subway Stations")
+
+```
+
+# Main Analysis
+
+The main analysis will attempt to fit variograms to a single day of data. The outcome variable will be the number of rides taken between the hours of 6 am and 10 am during weekdays. The analysis will only include stations in lower Manhattan as it's a more homogeneous population. 
+
+## Regression Analysis 
+
+Figure \@ref(fig:subway-overlay) shows a view of the data with subway stations and CitiBike stations. It's clear that there  are some areas with high density of stations of either kind.
+
+(ref:subway-overlay) Rider ship is denoted at CitiBike stations with blue circles that vary in size based on the number of rides. Dark circles note subway entrances.
+
+```{r subway-overlay, fig.cap="(ref:subway-overlay)"}
+spatial_data <- d_filt %>%
+  count(day_trip, startstationid) %>%
+  inner_join(labeled_stations, by = "startstationid")
+
+single_day <- spatial_data %>%
+  filter(day_trip =='2016-07-01') %>%
+  filter( n < quantile(n, .99))
+
+ggmap(sq_map) +
+  geom_point(aes(x = subway_long, y= subway_lat), data = subway_data) +
+  geom_point(aes(x = startstationlongitude, y = startstationlatitude, color = n, size = n),
+             alpha = 0.7, data = single_day) +
+  theme_inset() +
+  labs(title = "Citibike Ridership on July 1st, 2016,\nwith subway stations overlaid.")
+
+coordinates(single_day) <- c("startstationlongitude", "startstationlatitude")
+```
+
+The model was fit using a linear model. Step wise model selection was used. The initial model was defined as:
+
+$$
+\begin{aligned}
+log(n + 1) = (Intercept) + \beta_{ClosestSubway} + \beta_{CloseSubways} + \beta_{CloesetCiti} + \beta_{CloseCitis}
+\end{aligned}
+$$
+where n is the number of rides taken at the station. 1 was added to deal with stations that had 0 rides.
+
+The final model (after step wise selection) is shown below:
+
+```{r}
+lm_model <- lm(log(n+1) ~ 1, data = single_day)
+
+
+single_day$intercept <- residuals(lm_model)
+  
+lm_model <- lm(log(n+1) ~ closest_subway + close_subways + close_citibike + closest_citi, data = single_day)
+
+single_day$full_resid <- residuals(lm_model)
+
+lm_model <- step(lm_model, trace = 0)
+
+single_day$selected_resid <- residuals(lm_model)
+
+tidy(lm_model) %>% pander
+```
+
+Residuals were checked and found to approximately normal and well dispersed. Only the close subways variables was left, and it had a negative effect on ridership. This analysis was repeated with variogram modeling.
+
+\newpage
+
+## Fitting the Variogram
+
+A spherical variogram with a 0.01 nugget was fit to the data without regressors and then to same data but with the close_subways variable.
+
+(ref:vario-mod) The two variorums are shown above. The scale of the distance can be multiplied by 100 to approximate kilometers. e.g. .015 on the scale is approximately 1.5 km. _Left_: The variogram fit without regressors. _Middle_: The variogram fit with the number of close_subways regressors. _Right_: All regressors.
+
+```{r vario-mod, out.width="32%", fig.height=5, fig.width = 5, fig.cap = "(ref:vario-mod)", fig.show = 'hold'}
+vgm_sel <- vgm(.3, c("Sph"), nugget = 0.01)
+
+vt <- variogram(intercept ~ 1, single_day, cutoff = .020, width = .020/15)
+vfit <- (fit.variogram(vt, vgm_sel))
+plot(vt, vfit, main = "Variogram Without Regressors", ylim = c(0,.3))
+
+vt2 <- variogram(selected_resid ~ 1, single_day, cutoff = 0.020, width = .020/15)
+vfit2 <- (fit.variogram(vt2, vgm_sel))
+plot(vt2, vfit2, main = "Variogram With Selected Regressors", ylim = c(0,.3))
+
+vt3 <- variogram(full_resid ~ 1, data = single_day, cutoff = 0.020, width = .020/15)
+vfit3 <- (fit.variogram(vt3, vgm_sel))
+plot(vt3, vfit3, main = "Variogram With All Regressors", ylim = c(0,.3))
+
+```
+
+# Discussion 
+
+Using regular regression, it appears that the number of close subways is the only variable that is significantly associated with outcome. The simple linear regression suggests that each subway drops rider usage by about 4% ($e^{-0.04} \approx .96$). This disagrees with the original citation that suggest that higher subway density would result in more ridership. Likewise, measures of CitiBike station density were not found to be significant in predicting ridership turnout.
+
+Fitting the variogram on the entire data set produced a satisfactory fit. This suggests that there is a spatial relationship to the number of rides. Adding the regressors change the range property of the final variogram. A summary table of the two variograms (left and middle from figure \@ref(fig:vario-mod)).
+
+```{r}
+out <- vfit %>% as.data.frame() %>% select(model:range) %>% mutate(Regression = "None") %>% 
+  bind_rows(
+vfit2 %>%  as.data.frame() %>% select(model:range) %>% mutate(Regression = "Selected")
+)
+
+out %>% 
+  select(Regression, model:range) %>% 
+  pander()
+
+```
+
+There appears to be a small difference in the partial sill of the Spherical  component, but the range change much more dramatically. What this suggests is that adding the closest subway regressor localized the cluster differences more than they were previously. Instead of the clusters reaching to about 1.7 km in distance, now they only go out to about 1 km. (Range should be multiplied by 100 to get to km scale.)
+
+Further analysis can be made by expanding the number of regressors used to include other features mentioned in [@nacto]. This can include road width, presence of a bike line and nearness to large scale bike roads (such as the water ways that ring around New York)
+
+# References 
+
+
+
+
+
